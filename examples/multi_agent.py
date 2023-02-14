@@ -254,16 +254,17 @@ def main():
     """
     main entry point
     """
+    CONFIG_PATH = 'multi_config.yaml'
 
     work = {'mass': 3.463388126201571, # mass of car
             'lf': 0.15597534362552312, # length from front axle to CoG ..?
             'tlad': 0.82461887897713965, # total lookahead distance 
             'vgain': 1.375} # velocity gain
     
-    with open('multi_config.yaml') as file:
+    with open(CONFIG_PATH) as file:
         conf_dict = yaml.load(file, Loader=yaml.FullLoader)
     conf = Namespace(**conf_dict)
-
+    
     planner = PurePursuitPlanner(conf, (0.17145+0.15875)) #FlippyPlanner(speed=0.2, flip_every=1, steer=10)
 
     def render_callback(env_renderer):

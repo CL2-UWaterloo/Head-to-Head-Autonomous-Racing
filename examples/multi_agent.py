@@ -249,12 +249,114 @@ class FlippyPlanner:
         return self.speed, self.steer
 
 
+class AdversarialPlanner:
+    """
+    An adversarial planner
+    """
+    def __init__(self, conf, wb):
+        self.wheelbase = wb
+        self.conf = conf
+        self.load_waypoints(conf)
+        self.max_reacquire = 20.
+
+        self.drawn_waypoints = []
+        
+        # Store history of opponent states
+        self.ego_x_hist = []
+        self.ego_y_hist = []
+        self.ego_theta_hist = []
+        self.opp_x_hist = []
+        self.opp_y_hist = []
+        self.opp_theta_hist = []
+
+    def load_waypoints(self, conf):
+        """
+        loads waypoints
+        """
+        self.waypoints = np.loadtxt(conf.wpt_path, delimiter=conf.wpt_delim, skiprows=conf.wpt_rowskip)
+
+    def render_waypoints(self, e):
+        """
+        update waypoints being drawn by EnvRenderer
+        """
+
+        #points = self.waypoints
+
+        points = np.vstack((self.waypoints[:, self.conf.wpt_xind], self.waypoints[:, self.conf.wpt_yind])).T
+        
+        scaled_points = 50.*points
+
+        for i in range(points.shape[0]):
+            if len(self.drawn_waypoints) < points.shape[0]:
+                b = e.batch.add(1, GL_POINTS, None, ('v3f/stream', [scaled_points[i, 0], scaled_points[i, 1], 0.]),
+                                ('c3B/stream', [183, 193, 222]))
+                self.drawn_waypoints.append(b)
+            else:
+                self.drawn_waypoints[i].vertices = [scaled_points[i, 0], scaled_points[i, 1], 0.]
+        
+    def _get_current_waypoint(self, waypoints, lookahead_distance, position, theta):
+        """
+        gets the current waypoint to follow
+        """
+        wpts = np.vstack((self.waypoints[:, self.conf.wpt_xind], self.waypoints[:, self.conf.wpt_yind])).T
+        # t is the distance of the closest point to the current position relative to the total distance of the trajectory
+        nearest_point, nearest_dist, t, i = nearest_point_on_trajectory(position, wpts) 
+        if nearest_dist < lookahead_distance:
+            lookahead_point, i2, t2 = first_point_on_trajectory_intersecting_circle(position, lookahead_distance, wpts, i+t, wrap=True)
+            if i2 == None:
+                return None
+            current_waypoint = np.empty((3, ))
+            # x, y
+            current_waypoint[0:2] = wpts[i2, :]
+            # speed
+            current_waypoint[2] = waypoints[i, self.conf.wpt_vind]
+            return current_waypoint
+        elif nearest_dist < self.max_reacquire:
+            return np.append(wpts[i, :], waypoints[i, self.conf.wpt_vind])
+        else:
+            return None
+
+    def get_progress_along_track(self, position):
+        """
+        O(n) search time
+        """
+        wpts = np.vstack((self.waypoints[:, self.conf.wpt_xind], self.waypoints[:, self.conf.wpt_yind])).T
+        nearest_point, nearest_dist, t, i = nearest_point_on_trajectory(position, wpts)
+        return i / len(self.waypoints)
+
+
+    # Be able to see within track limits
+    def plan(self, ego_x, ego_y, ego_theta, opp_x, opp_y, opp_theta, lookahead_distance, vgain):
+        """
+        gives actuation given observation
+        """
+        self.ego_x_hist.append(ego_x)
+        self.ego_y_hist.append(ego_y)
+        self.ego_theta_hist.append(ego_theta)
+        self.opponent_x_hist.append(opp_x)
+        self.opp_y_hist.append(opp_y)
+        self.opp_theta_hist.append(opp_theta)
+        
+
+        position = np.array([ego_x, ego_y])
+        lookahead_point = self._get_current_waypoint(self.waypoints, lookahead_distance, position, ego_theta)
+
+        if lookahead_point is None:
+            return 4.0, 0.0
+
+        speed, steering_angle = get_actuation(pose_theta, lookahead_point, position, lookahead_distance, self.wheelbase)
+        speed = vgain * speed
+
+        return speed, steering_angle
+
+
 
 def main():
     """
     main entry point
     """
     CONFIG_PATH = 'multi_config.yaml'
+    RENDER = False
 
     work = {'mass': 3.463388126201571, # mass of car
             'lf': 0.15597534362552312, # length from front axle to CoG ..?
@@ -286,11 +388,13 @@ def main():
         planner.render_waypoints(env_renderer)
 
     env = gym.make('f110_gym:f110-v0', map=conf.map_path, map_ext=conf.map_ext, num_agents=2, timestep=0.01, integrator=Integrator.RK4)
-    env.add_render_callback(render_callback)
+    if RENDER:
+        env.add_render_callback(render_callback)
     
     obs, step_reward, done, info = env.reset(np.array([[conf.ego_sx, conf.ego_sy, conf.ego_stheta],
                                                        [conf.opp_sx, conf.opp_sy, conf.opp_stheta]]))
-    env.render()
+    if RENDER:
+        env.render()
 
     laptime = 0.0
     start = time.time()
@@ -320,7 +424,8 @@ def main():
         obs, step_reward, done, info = env.step(np.array([[ego_steer, ego_speed],
                                                           [opp_steer, opp_speed]]))
         laptime += step_reward
-        env.render(mode='human')
+        if RENDER:
+            env.render(mode='human')
         
     print('Sim elapsed time:', laptime, 'Real elapsed time:', time.time()-start)
 

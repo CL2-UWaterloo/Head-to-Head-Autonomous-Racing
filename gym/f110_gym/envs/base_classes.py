@@ -548,7 +548,7 @@ class Simulator(object):
         Steps the simulation environment
 
         Args:
-            control_inputs (np.ndarray (num_agents, 2)): control inputs of all agents, first column is desired steering angle, second column is desired velocity
+            control_inputs (np.ndarray (num_agents, 2)): control inputs of all agents, first column is desired steering angle, second column is desired velocitya
         
         Returns:
             observations (dict): dictionary for observations: poses of agents, current laser scan of each agent, collision indicators, etc.
@@ -584,7 +584,7 @@ class Simulator(object):
         # fill in observations
         # state is [x, y, steer_angle, vel, yaw_angle, yaw_rate, slip_angle]
         # collision_angles is removed from observations
-        observations = {'ego_idx': self.ego_idx,
+        observations = {'ego_idx': [self.ego_idx],
             'scans': [],
             'poses_x': [],
             'poses_y': [],
@@ -614,7 +614,7 @@ class Simulator(object):
         Returns:
             None
         """
-        
+
         if poses.shape[0] != self.num_agents:
             raise ValueError('Number of poses for reset does not match number of agents.')
 

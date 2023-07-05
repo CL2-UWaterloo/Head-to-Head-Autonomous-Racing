@@ -42,6 +42,8 @@ import pyglet
 pyglet.options['debug_gl'] = False
 from pyglet import gl
 
+from numba import njit
+
 # constants
 
 # rendering
@@ -49,6 +51,124 @@ VIDEO_W = 600
 VIDEO_H = 400
 WINDOW_W = 1000
 WINDOW_H = 800
+
+@njit(fastmath=False, cache=True)
+def nearest_point_on_trajectory(point, trajectory):
+    """
+    Return the nearest point along the given piecewise linear trajectory.
+
+    Same as nearest_point_on_line_segment, but vectorized. This method is quite fast, time constraints should
+    not be an issue so long as trajectories are not insanely long.
+
+        Order of magnitude: trajectory length: 1000 --> 0.0002 second computation (5000fps)
+
+    point: size 2 numpy array
+    trajectory: Nx2 matrix of (x,y) trajectory waypoints
+        - these must be unique. If they are not unique, a divide by 0 error will destroy the world
+    """
+    diffs = trajectory[1:,:] - trajectory[:-1,:]
+    l2s   = diffs[:,0]**2 + diffs[:,1]**2
+    # this is equivalent to the elementwise dot product
+    # dots = np.sum((point - trajectory[:-1,:]) * diffs[:,:], axis=1)
+    dots = np.empty((trajectory.shape[0]-1, ))
+    for i in range(dots.shape[0]):
+        dots[i] = np.dot((point - trajectory[i, :]), diffs[i, :])
+    t = dots / l2s
+    t[t<0.0] = 0.0
+    t[t>1.0] = 1.0
+    # t = np.clip(dots / l2s, 0.0, 1.0)
+    projections = trajectory[:-1,:] + (t*diffs.T).T
+    # dists = np.linalg.norm(point - projections, axis=1)
+    dists = np.empty((projections.shape[0],))
+    for i in range(dists.shape[0]):
+        temp = point - projections[i]
+        dists[i] = np.sqrt(np.sum(temp*temp))
+    min_dist_segment = np.argmin(dists)
+    return projections[min_dist_segment], dists[min_dist_segment], t[min_dist_segment], min_dist_segment
+
+@njit(fastmath=False, cache=True)
+def first_point_on_trajectory_intersecting_circle(point, radius, trajectory, t=0.0, wrap=False):
+    """
+    starts at beginning of trajectory, and find the first point one radius away from the given point along the trajectory.
+
+    Assumes that the first segment passes within a single radius of the point
+
+    http://codereview.stackexchange.com/questions/86421/line-segment-to-circle-collision-algorithm
+    """
+    start_i = int(t)
+    start_t = t % 1.0
+    first_t = None
+    first_i = None
+    first_p = None
+    trajectory = np.ascontiguousarray(trajectory)
+    for i in range(start_i, trajectory.shape[0]-1):
+        start = trajectory[i,:]
+        end = trajectory[i+1,:]+1e-6
+        V = np.ascontiguousarray(end - start)
+
+        a = np.dot(V,V)
+        b = 2.0*np.dot(V, start - point)
+        c = np.dot(start, start) + np.dot(point,point) - 2.0*np.dot(start, point) - radius*radius
+        discriminant = b*b-4*a*c
+
+        if discriminant < 0:
+            continue
+        #   print "NO INTERSECTION"
+        # else:
+        # if discriminant >= 0.0:
+        discriminant = np.sqrt(discriminant)
+        t1 = (-b - discriminant) / (2.0*a)
+        t2 = (-b + discriminant) / (2.0*a)
+        if i == start_i:
+            if t1 >= 0.0 and t1 <= 1.0 and t1 >= start_t:
+                first_t = t1
+                first_i = i
+                first_p = start + t1 * V
+                break
+            if t2 >= 0.0 and t2 <= 1.0 and t2 >= start_t:
+                first_t = t2
+                first_i = i
+                first_p = start + t2 * V
+                break
+        elif t1 >= 0.0 and t1 <= 1.0:
+            first_t = t1
+            first_i = i
+            first_p = start + t1 * V
+            break
+        elif t2 >= 0.0 and t2 <= 1.0:
+            first_t = t2
+            first_i = i
+            first_p = start + t2 * V
+            break
+    # wrap around to the beginning of the trajectory if no intersection is found1
+    if wrap and first_p is None:
+        for i in range(-1, start_i):
+            start = trajectory[i % trajectory.shape[0],:]
+            end = trajectory[(i+1) % trajectory.shape[0],:]+1e-6
+            V = end - start
+
+            a = np.dot(V,V)
+            b = 2.0*np.dot(V, start - point)
+            c = np.dot(start, start) + np.dot(point,point) - 2.0*np.dot(start, point) - radius*radius
+            discriminant = b*b-4*a*c
+
+            if discriminant < 0:
+                continue
+            discriminant = np.sqrt(discriminant)
+            t1 = (-b - discriminant) / (2.0*a)
+            t2 = (-b + discriminant) / (2.0*a)
+            if t1 >= 0.0 and t1 <= 1.0:
+                first_t = t1
+                first_i = i
+                first_p = start + t1 * V
+                break
+            elif t2 >= 0.0 and t2 <= 1.0:
+                first_t = t2
+                first_i = i
+                first_p = start + t2 * V
+                break
+
+    return first_p, first_i, first_t
 
 class F110Env(gym.Env):
     """
@@ -150,6 +270,12 @@ class F110Env(gym.Env):
         except:
             self.integrator = Integrator.RK4
 
+        # reset poses
+        self.reset_poses = kwargs['reset_poses']
+            
+        self.conf = kwargs['conf']
+        self.load_waypoints(self.conf)
+        self.progress = 0
         # radius to consider done
         self.start_thresh = 0.5  # 10cm
 
@@ -186,12 +312,69 @@ class F110Env(gym.Env):
 
         # stateful observations for rendering
         self.render_obs = None
+        
+        
+        # Observation space and action space TODO: Set proper bounds
+        self.action_space = spaces.Box(low=np.array([[-1.0, 0.0]]), high=np.array([[1.0, 4.0]]),dtype=np.float64) # only works for 1 agent for now
+        self.observation_space = spaces.Dict(
+            {
+                # 'ego_idx': spaces.Box(low=0, high=np.inf, shape=(1, ), dtype=np.int16),
+                'scans': spaces.Box(low=0, high=np.inf, shape=(self.num_agents, 1080), dtype=np.float64),
+                'poses_x': spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_agents, ), dtype=np.float64),
+                'poses_y': spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_agents, ), dtype=np.float64),
+                'poses_theta': spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_agents, ), dtype=np.float64),
+                'linear_vels_x': spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_agents, ), dtype=np.float64),
+                'linear_vels_y': spaces.Box(low=0, high=0, shape=(self.num_agents, ), dtype=np.float64),
+                'ang_vels_z': spaces.Box(low=-100.0, high=100.0, shape=(self.num_agents, ), dtype=np.float64),
+                # 'collisions': spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_agents, ), dtype=np.float64),
+            }
+        )
+
 
     def __del__(self):
         """
         Finalizer, does cleanup
         """
         pass
+
+    def load_waypoints(self, conf):
+        """
+        loads waypoints
+        """
+        self.waypoints = np.loadtxt(conf.wpt_path, delimiter=conf.wpt_delim, skiprows=conf.wpt_rowskip)
+
+    def _get_current_waypoint(self, waypoints, lookahead_distance, position, theta):
+        """
+        gets the current waypoint to follow
+        """
+        wpts = np.vstack((self.waypoints[:, self.conf.wpt_xind], self.waypoints[:, self.conf.wpt_yind])).T
+        # t is the distance of the closest point to the current position relative to the total distance of the trajectory
+        nearest_point, nearest_dist, t, i = nearest_point_on_trajectory(position, wpts) 
+        if nearest_dist < lookahead_distance:
+            lookahead_point, i2, t2 = first_point_on_trajectory_intersecting_circle(position, lookahead_distance, wpts, i+t, wrap=True)
+            if i2 == None:
+                return None
+            current_waypoint = np.empty((3, ))
+            # x, y
+            current_waypoint[0:2] = wpts[i2, :]
+            # speed
+            current_waypoint[2] = waypoints[i, self.conf.wpt_vind]
+            return current_waypoint
+        elif nearest_dist < self.max_reacquire:
+            return np.append(wpts[i, :], waypoints[i, self.conf.wpt_vind])
+        else:
+            return None
+
+    def get_progress_along_track(self, position):
+        """
+        O(n) search time
+        """
+        wpts = np.vstack((self.waypoints[:, self.conf.wpt_xind], self.waypoints[:, self.conf.wpt_yind])).T
+        nearest_point, nearest_dist, t, i = nearest_point_on_trajectory(position, wpts)
+        return i / len(self.waypoints), nearest_dist
+
+
+
 
     def _check_done(self):
         """
@@ -283,7 +466,18 @@ class F110Env(gym.Env):
             }
 
         # times
-        reward = self.timestep
+
+        if len(self.poses_x) == 0:
+            reward = - self.timestep
+        else:
+            # Distance to racing line
+            progress, distance = self.get_progress_along_track(np.array([self.poses_x[0], self.poses_y[0]]))
+            # Three factors: progress along track, distance to racing line, and time
+            ALPHA = 0
+            BETA = 0
+            GAMMA = 0
+            reward = 10 * (progress - self.progress) - distance
+            self.progress = progress
         self.current_time = self.current_time + self.timestep
         
         # update data member
@@ -292,10 +486,10 @@ class F110Env(gym.Env):
         # check done
         done, toggle_list = self._check_done()
         info = {'checkpoint_done': toggle_list}
-
+        
         return obs, reward, done, info
 
-    def reset(self, poses):
+    def reset(self):
         """
         Reset the gym environment by given poses
 
@@ -308,6 +502,7 @@ class F110Env(gym.Env):
             done (bool): if the simulation is done
             info (dict): auxillary information dictionary
         """
+        poses = self.reset_poses
         # reset counters and data members
         self.current_time = 0.0
         self.collisions = np.zeros((self.num_agents, ))
@@ -338,7 +533,7 @@ class F110Env(gym.Env):
             'lap_counts': obs['lap_counts']
             }
         
-        return obs, reward, done, info
+        return obs
 
     def update_map(self, map_path, map_ext):
         """

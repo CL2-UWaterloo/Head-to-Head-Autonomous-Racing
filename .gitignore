@@ -1,3 +1,5 @@
+logs/
+env/
 build/
 gym/f110_gym.egg-info
 __pycache__
